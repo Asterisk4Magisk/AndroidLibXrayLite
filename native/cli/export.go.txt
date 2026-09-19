@@ -1,0 +1,56 @@
+package main
+
+/*
+#include <unistd.h>
+
+extern char **environ;
+static char *android_env_at(int index) { return environ[index]; }
+*/
+import "C"
+
+import (
+	"log"
+	"os"
+	"strings"
+	"unsafe"
+)
+
+// AndroidXrayCLI_v1 is exclusively for a CLI process, never for a JNI caller.
+// Upstream commands retain their os.Exit behavior. The runtime invokes this only
+// after package initialization, so mobileinit has finished redirecting stdio.
+//export AndroidXrayCLI_v1
+func AndroidXrayCLI_v1(argc C.int, argv **C.char, stdoutFD, stderrFD C.int) C.int {
+	if C.dup2(stdoutFD, 1) < 0 || C.dup2(stderrFD, 2) < 0 {
+		return 70
+	}
+	C.close(stdoutFD)
+	C.close(stderrFD)
+	log.SetOutput(os.Stderr)
+	// Android's dynamically loaded Go runtime does not inherit libc's environ.
+	// Snapshot it before os.Setenv, which can reallocate libc's environment.
+	var environment []string
+	for i := C.int(0); ; i++ {
+		entry := C.android_env_at(i)
+		if entry == nil {
+			break
+		}
+		environment = append(environment, C.GoString(entry))
+	}
+	for _, entry := range environment {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			if err := os.Setenv(key, value); err != nil {
+				log.Printf("Cannot initialize CLI environment: %v", err)
+				return 70
+			}
+		}
+	}
+	args := unsafe.Slice(argv, int(argc))
+	os.Args = make([]string, len(args))
+	for i, arg := range args {
+		os.Args[i] = C.GoString(arg)
+	}
+	initXrayCLI()
+	xrayCLIMain()
+	return 0
+}
