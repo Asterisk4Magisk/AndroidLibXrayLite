@@ -26,6 +26,38 @@ def rename_function(source, old, new):
     return source.replace(pattern, f'func {new}() {{')
 
 
+def replace_once(source, old, new):
+    if source.count(old) != 1:
+        raise ValueError(f'Upstream changed: expected exactly one {old!r}')
+    return source.replace(old, new)
+
+
+def build_system_dns_helper(repo, work, env):
+    sdk = pathlib.Path(env['ANDROID_HOME']).resolve()
+    android_jar = sdk / 'platforms/android-37.0/android.jar'
+    d8 = sdk / 'build-tools/37.0.0/lib/d8.jar'
+    for required in (android_jar, d8):
+        if not required.is_file():
+            raise ValueError(f'Android SDK component missing: {required}')
+    suffix = '.exe' if os.name == 'nt' else ''
+    java_home = env.get('JAVA_HOME')
+    def java_tool(name):
+        return pathlib.Path(java_home) / 'bin' / (name + suffix) if java_home else name + suffix
+    classes = work / 'system-dns-classes'
+    dex = work / 'system-dns-dex'
+    for directory in (classes, dex):
+        shutil.rmtree(directory, ignore_errors=True)
+        directory.mkdir()
+    run([java_tool('javac'), '--release', '8', '-classpath', android_jar,
+         '-d', classes, *sorted((repo / 'native/systemdns/java').rglob('*.java'))], repo, env)
+    run([java_tool('java'), '-cp', d8, 'com.android.tools.r8.D8', '--release',
+         '--min-api', '26', '--lib', android_jar, '--output', dex,
+         *sorted(classes.rglob('*.class'))], repo, env)
+    if sorted(path.name for path in dex.iterdir()) != ['classes.dex']:
+        raise ValueError('System DNS helper must fit in one dex')
+    return dex / 'classes.dex'
+
+
 def package_aar(baseline, target, artifacts):
     replacements = {}
     for abi, (core, launcher) in artifacts.items():
@@ -48,7 +80,7 @@ def package_aar(baseline, target, artifacts):
 
 def run(command, cwd, env, log=None):
     print('+ ' + ' '.join(map(str, command)), flush=True)
-    result = subprocess.run(list(map(str, command)), cwd=cwd, env=env, text=True,
+    result = subprocess.run(list(map(str, command)), cwd=cwd, env=env, text=True, errors='replace',
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if log:
         pathlib.Path(log).write_text(result.stdout, encoding='utf-8')
@@ -85,6 +117,7 @@ def build(args, work):
         raise ValueError('gomobile did not report its work directory')
     generated = pathlib.Path(matches[-1].strip())
     core = pathlib.Path(run(['go', 'list', '-m', '-f', '{{.Dir}}', 'github.com/xtls/xray-core'], repo, env))
+    helper_dex = build_system_dns_helper(repo, work, env)
     artifacts = {}
     for arch in args.arch:
         abi, triple = ARCHES[arch]
@@ -92,7 +125,21 @@ def build(args, work):
         source = module / 'gobind'
         for filename, old, new in [('main.go', 'main', 'xrayCLIMain'), ('run.go', 'init', 'initXrayCLI')]:
             text = rename_function((core / 'main' / filename).read_text(), old, new)
+            if filename == 'run.go':
+                # Configuration tests start no observer; a running service
+                # starts it before loading configuration.
+                anchor = '\tprintVersion()\n\tserver, err := startXray()\n'
+                text = replace_once(text, anchor, '\tprintVersion()\n\tif !*test {\n'
+                                    '\t\tdefer startSystemDNS()()\n\t}\n\tserver, err := startXray()\n')
             (source / ('xray_' + filename)).write_text(text, encoding='utf-8')
+        # The CLI's system DNS package lives in gomobile's module, keeping the
+        # generated dex out of the checkout and the package out of the JNI API.
+        systemdns = module / 'systemdns'
+        systemdns.mkdir(exist_ok=True)
+        for file in (repo / 'native/systemdns').glob('*.go'):
+            if not file.name.endswith('_test.go'):
+                shutil.copyfile(file, systemdns / file.name)
+        shutil.copyfile(helper_dex, systemdns / 'helper.dex')
         shutil.copyfile(core / 'main/version.go', source / 'xray_version.go')
         shutil.copyfile(repo / 'native/cli/export.go.txt', source / 'cli_export.go')
         native = work / abi
