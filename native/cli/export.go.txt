@@ -13,6 +13,8 @@ import (
 	"os"
 	"strings"
 	"unsafe"
+
+	"gobind/systemdns"
 )
 
 // AndroidXrayCLI_v1 is exclusively for a CLI process, never for a JNI caller.
@@ -53,4 +55,9 @@ func AndroidXrayCLI_v1(argc C.int, argv **C.char, stdoutFD, stderrFD C.int) C.in
 	initXrayCLI()
 	xrayCLIMain()
 	return 0
+}
+
+// Called by the run command for a running service, never for -test.
+func startSystemDNS() func() {
+	return systemdns.StartService()
 }
