@@ -3,11 +3,12 @@ package libv2ray
 import (
 	"fmt"
 
+	"github.com/2dust/AndroidLibXrayLite/native/flowmeta"
 	corenet "github.com/xtls/xray-core/common/net"
 )
 
 // ProcessFinder is an interface for Android process finding functionality.
-// Apps using AndroidLibXrayLite should implement FindProcessByConnection()
+// Apps using AndroidLibXrayLite should implement its connection and package lookups
 // and pass the implementation to RegisterProcessFinder() before starting the core.
 type ProcessFinder interface {
 	// FindProcessByConnection finds the UID of the process that owns the given connection.
@@ -19,6 +20,9 @@ type ProcessFinder interface {
 	// destPort: Destination port
 	// Returns the UID of the owning process, or -1 if not found.
 	FindProcessByConnection(network, srcIP string, srcPort int, destIP string, destPort int) int
+
+	// FindUIDByPackageName returns the package UID, or -1 if not installed.
+	FindUIDByPackageName(packageName string) int
 }
 
 // RegisterProcessFinder registers an Android process finder with Xray-core,
@@ -27,9 +31,11 @@ type ProcessFinder interface {
 // Pass nil to unregister a previously registered finder.
 func (x *CoreController) RegisterProcessFinder(finder ProcessFinder) {
 	if finder == nil {
+		flowmeta.RegisterPackageUIDResolver(nil)
 		corenet.RegisterAndroidProcessFinder(nil)
 		return
 	}
+	flowmeta.RegisterPackageUIDResolver(finder.FindUIDByPackageName)
 
 	corenet.RegisterAndroidProcessFinder(func(network, srcIP string, srcPort uint16, destIP string, destPort uint16) (uid int, name string, path string, err error) {
 		// getConnectionOwnerUid only works for established connections,
@@ -45,9 +51,12 @@ func (x *CoreController) RegisterProcessFinder(finder ProcessFinder) {
 			}
 		}()
 		uid = finder.FindProcessByConnection(network, srcIP, int(srcPort), destIP, int(destPort))
-		// if uid < 0 {
-		// 	return 0, "", "", fmt.Errorf("processFinder, not found for %s %s:%d -> %s:%d", network, srcIP, srcPort, destIP, destPort)
-		// }
+		if uid < 0 {
+			uid, err = flowmeta.FindUID(network, srcIP, srcPort, destIP, destPort)
+			if err != nil {
+				return 0, "", "", err
+			}
+		}
 		return uid, fmt.Sprintf("%d", uid), "", nil
 	})
 }

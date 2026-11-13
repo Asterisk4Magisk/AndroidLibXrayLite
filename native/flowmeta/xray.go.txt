@@ -1,0 +1,125 @@
+// Copyright 2026, Asterisk4Magisk contributors
+// SPDX-License-Identifier: LGPL-3.0
+
+package socks
+
+import (
+	"context"
+	"net/netip"
+	"time"
+
+	"github.com/2dust/AndroidLibXrayLite/native/flowmeta"
+	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet/stat"
+)
+
+type flowServer struct {
+	token string
+}
+
+func newFlowServer(ctx context.Context, config *ServerConfig) (any, error) {
+	token, enabled := config.Accounts["__asterisk_flow_v1"]
+	if !enabled {
+		return NewServer(ctx, config)
+	}
+	if len(token) != 32 {
+		return nil, errors.New("invalid bridge credential")
+	}
+	return &flowServer{token: token}, nil
+}
+
+func (s *flowServer) Network() []net.Network {
+	return []net.Network{net.Network_TCP, net.Network_UDP}
+}
+
+func flowContext(ctx context.Context, h flowmeta.Header) (context.Context, net.Destination) {
+	inbound := &session.Inbound{}
+	if previous := session.InboundFromContext(ctx); previous != nil {
+		*inbound = *previous
+	}
+	inbound.Name = "asterisk-bridge"
+	inbound.Source = net.DestinationFromAddr(h.Addr(true))
+	target := net.DestinationFromAddr(h.Addr(false))
+	inbound.Local = target
+	inbound.ProcessLookup = flowmeta.ProcessLookup(h, net.FindProcess)
+	inbound.CanSpliceCopy = 3
+	return session.ContextWithInbound(ctx, inbound), target
+}
+
+func (s *flowServer) Process(ctx context.Context, network net.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
+	if network == net.Network_TCP {
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		h, err := flowmeta.Read(conn, s.token)
+		if err != nil {
+			return err
+		}
+		_ = conn.SetReadDeadline(time.Time{})
+		flowCtx, target := flowContext(ctx, h)
+		return dispatcher.DispatchLink(flowCtx, target, &transport.Link{
+			Reader: buf.NewReader(conn),
+			Writer: buf.NewWriter(conn),
+		})
+	}
+	hub := flowmeta.NewUDP(conn.Write, s.token, func(flow *flowmeta.UDPConn) {
+		s.dispatchUDP(ctx, flow, dispatcher)
+	})
+	defer hub.Close()
+	reader := buf.NewPacketReader(conn)
+	for {
+		packets, err := reader.ReadMultiBuffer()
+		for _, packet := range packets {
+			_ = hub.Feed(packet)
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (s *flowServer) dispatchUDP(ctx context.Context, flow *flowmeta.UDPConn, dispatcher routing.Dispatcher) {
+	flowCtx, target := flowContext(ctx, flow.Header)
+	link, err := dispatcher.Dispatch(flowCtx, target)
+	if err != nil {
+		return
+	}
+	defer common.Interrupt(link.Reader)
+	defer common.Interrupt(link.Writer)
+	go func() {
+		defer flow.Close()
+		for {
+			packets, err := link.Reader.ReadMultiBuffer()
+			for i, packet := range packets {
+				remote := flow.Header.Destination
+				if packet.UDP != nil && packet.UDP.Address.Family().IsIP() {
+					ip, _ := netip.AddrFromSlice(packet.UDP.Address.IP())
+					remote = netip.AddrPortFrom(ip.Unmap(), uint16(packet.UDP.Port))
+				}
+				_, writeErr := flow.WriteFrom(packet.Bytes(), remote)
+				packet.Release()
+				if writeErr != nil {
+					buf.ReleaseMulti(packets[i+1:])
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	for {
+		packet, err := flow.ReadPacket()
+		if err != nil {
+			return
+		}
+		packet.UDP = &target
+		if err = link.Writer.WriteMultiBuffer(buf.MultiBuffer{packet}); err != nil {
+			return
+		}
+	}
+}

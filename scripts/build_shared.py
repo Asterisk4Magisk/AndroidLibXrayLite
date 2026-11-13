@@ -32,6 +32,42 @@ def replace_once(source, old, new):
     return source.replace(old, new)
 
 
+def prepare_core_sources(repo, core, env):
+    files = []
+    for name, old, new in (
+        ('proxy/socks/server.go', 'return NewServer(ctx, config.(*ServerConfig))',
+         'return newFlowServer(ctx, config.(*ServerConfig))'),
+        ('common/session/session.go', 'type Inbound struct {',
+         'type Inbound struct {\n'
+         '\t// ProcessLookup retains attribution captured by the private bridge.\n'
+         '\tProcessLookup func() (int, string, string, error)\n'),
+        ('app/router/condition.go',
+         'net.FindProcess(network, srcIP, uint16(srcPort), dstIP, uint16(dstPort))',
+         'findFlowProcess(ctx, net.FindProcess, network, srcIP, uint16(srcPort), dstIP, uint16(dstPort))'),
+        ('app/router/condition.go', 'type ProcessNameMatcher struct {',
+         'type ProcessNameMatcher struct {\n\tPackageAppIDs []uint32\n'),
+        ('app/router/condition.go', 'return &ProcessNameMatcher{',
+         'return &ProcessNameMatcher{\n\t\tPackageAppIDs: flowPackageAppIDs(names),'),
+        ('app/router/condition.go', 'slices.Contains(m.ProcessNames, name)',
+         'matchFlowProcessName(m.ProcessNames, m.PackageAppIDs, pid, name)'),
+        ('app/router/lua.go',
+         'return finder(network, sources[0].String(), uint16(ctx.GetSourcePort()), targetIP, targetPort)',
+         'return findFlowProcess(ctx, finder, network, sources[0].String(), uint16(ctx.GetSourcePort()), targetIP, targetPort)'),
+    ):
+        target = core / name
+        target.write_text(replace_once(target.read_text(), old, new), encoding='utf-8')
+        files.append(target)
+    for target, source in (
+        ('proxy/socks/asterisk_flow.go', 'xray.go.txt'),
+        ('app/router/asterisk_flow.go', 'router.go.txt'),
+        ('app/router/asterisk_flow_test.go', 'router_test.go.txt'),
+    ):
+        target = core / target
+        shutil.copyfile(repo / 'native/flowmeta' / source, target)
+        files.append(target)
+    run(['gofmt', '-w', *dict.fromkeys(files)], core, env)
+
+
 def build_system_dns_helper(repo, work, env):
     sdk = pathlib.Path(env['ANDROID_HOME']).resolve()
     android_jar = sdk / 'platforms/android-37.0/android.jar'
@@ -105,18 +141,35 @@ def build(args, work):
     temp.mkdir(exist_ok=True)
     env.update(GOBIN=str(tools), TEMP=str(temp), TMP=str(temp), TMPDIR=str(temp))
     env['PATH'] = str(tools) + os.pathsep + env['PATH']
+    # go list can return an empty module directory until its source is downloaded.
+    run(['go', 'mod', 'download', 'github.com/xtls/xray-core'], repo, env)
+    upstream = pathlib.Path(run(['go', 'list', '-m', '-f', '{{.Dir}}', 'github.com/xtls/xray-core'], repo, env))
+    core, source = work / 'core', work / 'source'
+    shutil.copytree(upstream, core, dirs_exist_ok=True)
+    # copytree preserves the module cache's read-only file and directory modes.
+    core.chmod(core.stat().st_mode | 0o200)
+    for original in core.rglob('*'):
+        original.chmod(original.stat().st_mode | 0o200)
+    prepare_core_sources(repo, core, env)
+
+    def ignore_source(directory, names):
+        ignored = set(shutil.ignore_patterns('.git', '.idea', '__pycache__', '*.aar', '*.jar')(directory, names))
+        ignored.update(name for name in names if (pathlib.Path(directory) / name).resolve() == work.resolve())
+        return ignored
+
+    shutil.copytree(repo, source, ignore=ignore_source, dirs_exist_ok=True)
+    run(['go', 'mod', 'edit', '-replace=github.com/xtls/xray-core=' + str(core)], source, env)
     mobile = run(['go', 'list', '-m', '-f', '{{.Version}}', 'golang.org/x/mobile'], repo, env)
     for tool in ('gomobile', 'gobind'):
         run(['go', 'install', f'golang.org/x/mobile/cmd/{tool}@{mobile}'], repo, env)
     baseline = work / 'baseline.aar'
     output = run([tools / ('gomobile' + suffix), 'bind', '-work', '-x', '-target',
                   ','.join('android/' + arch for arch in args.arch), '-androidapi', str(args.api),
-                  '-trimpath', '-ldflags=' + LDFLAGS, '-o', baseline, '.'], repo, env, work / 'gomobile.log')
+                  '-trimpath', '-ldflags=' + LDFLAGS, '-o', baseline, '.'], source, env, work / 'gomobile.log')
     matches = re.findall(r'^WORK=(.+)$', output, re.MULTILINE)
     if not matches:
         raise ValueError('gomobile did not report its work directory')
     generated = pathlib.Path(matches[-1].strip())
-    core = pathlib.Path(run(['go', 'list', '-m', '-f', '{{.Dir}}', 'github.com/xtls/xray-core'], repo, env))
     helper_dex = build_system_dns_helper(repo, work, env)
     artifacts = {}
     for arch in args.arch:
