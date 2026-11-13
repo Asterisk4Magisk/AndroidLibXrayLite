@@ -9,17 +9,22 @@ static char *android_env_at(int index) { return environ[index]; }
 import "C"
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strings"
 	"unsafe"
 
 	"gobind/systemdns"
+
+	"github.com/2dust/AndroidLibXrayLite/native/flowmeta"
+	corenet "github.com/xtls/xray-core/common/net"
 )
 
 // AndroidXrayCLI_v1 is exclusively for a CLI process, never for a JNI caller.
 // Upstream commands retain their os.Exit behavior. The runtime invokes this only
 // after package initialization, so mobileinit has finished redirecting stdio.
+//
 //export AndroidXrayCLI_v1
 func AndroidXrayCLI_v1(argc C.int, argv **C.char, stdoutFD, stderrFD C.int) C.int {
 	if C.dup2(stdoutFD, 1) < 0 || C.dup2(stderrFD, 2) < 0 {
@@ -52,6 +57,13 @@ func AndroidXrayCLI_v1(argc C.int, argv **C.char, stdoutFD, stderrFD C.int) C.in
 	for i, arg := range args {
 		os.Args[i] = C.GoString(arg)
 	}
+	if os.Geteuid() == 0 {
+		flowmeta.RegisterPackageUIDResolver(flowmeta.FindPackageUID)
+	}
+	corenet.RegisterAndroidProcessFinder(func(network, source string, sp uint16, destination string, dp uint16) (int, string, string, error) {
+		uid, err := flowmeta.FindUID(network, source, sp, destination, dp)
+		return uid, fmt.Sprint(uid), "", err
+	})
 	initXrayCLI()
 	xrayCLIMain()
 	return 0

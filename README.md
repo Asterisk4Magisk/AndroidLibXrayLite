@@ -49,6 +49,18 @@ set this to the directory containing `geoip.dat` and `geosite.dat`.
 The CLI entry is exclusively for a standalone process and must never be called inside
 the app's JVM: upstream CLI commands may terminate their process.
 
+## Android process rules
+
+ROOT and JNI accept the same `process` package names without rewriting the JSON.
+Package aliases are resolved when routing rules are loaded, using `packages.list`
+in the ROOT CLI and `ProcessFinder.FindUIDByPackageName` in JNI. Return `-1` for
+unknown packages; they remain non-matching. Package rules match the application's
+app ID across Android users, while numeric UID rules match the complete UID.
+Reload the configuration after installing or removing an application.
+
+TPROXY and TUN process lookups use the original destination saved before sniffing
+or FakeDNS rewrites. Private bridge flows retain their captured tuple and UID.
+
 ## ROOT system DNS integration
 
 Xray's `localhost` DNS uses Go's default resolver. On Android that asks netd,
