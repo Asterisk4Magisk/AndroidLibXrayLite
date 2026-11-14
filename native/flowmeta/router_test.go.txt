@@ -1,0 +1,172 @@
+// Copyright 2026, Asterisk4Magisk contributors
+// SPDX-License-Identifier: LGPL-3.0
+
+package router
+
+import (
+	"net/netip"
+	"strconv"
+	"testing"
+
+	"github.com/2dust/AndroidLibXrayLite/native/flowmeta"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/features/routing/dns"
+	R "github.com/xtls/xray-core/features/routing/session"
+)
+
+func TestFlowOwnerKeepsPreSniffTarget(t *testing.T) {
+	header := flowmeta.Header{
+		Source:      netip.MustParseAddrPort("172.19.0.1:35000"),
+		Destination: netip.MustParseAddrPort("198.18.0.9:443"),
+		UID:         flowmeta.UnknownUID,
+	}
+	calls := 0
+	finder := func(network, source string, sp uint16, destination string, dp uint16) (int, string, string, error) {
+		calls++
+		if network != "tcp" || source != "172.19.0.1" || sp != 35000 || destination != "198.18.0.9" || dp != 443 {
+			t.Fatalf("wrong original tuple: %s %s:%d %s:%d", network, source, sp, destination, dp)
+		}
+		return 1012345, "1012345", "", nil
+	}
+	ctx := &R.Context{
+		Inbound:  &session.Inbound{ProcessLookup: flowmeta.ProcessLookup(header, finder)},
+		Outbound: &session.Outbound{Target: net.TCPDestination(net.DomainAddress("sniffed.example"), 443)},
+	}
+	for range 2 {
+		uid, _, _, err := findFlowProcess(&dns.ResolvableContext{Context: ctx}, finder, "tcp", "rewritten", 1, "rewritten", 2)
+		if err != nil || uid != 1012345 || calls != 1 {
+			t.Fatal(uid, err, calls)
+		}
+	}
+	// Other inbounds still use the supplied upstream finder and tuple.
+	ctx.Inbound = nil
+	_, _, _, _ = findFlowProcess(ctx, finder, "tcp", "172.19.0.1", 35000, "198.18.0.9", 443)
+	if calls != 2 {
+		t.Fatal("ordinary inbound bypassed the upstream finder")
+	}
+}
+
+func TestTransparentProcessKeepsPreSniffTarget(t *testing.T) {
+	for _, test := range []struct {
+		inbound string
+		network string
+		source  string
+		target  string
+	}{
+		{"dokodemo-door", "tcp", "172.19.0.1:35000", "198.18.0.9:443"},
+		{"dokodemo-door", "udp", "172.19.0.1:35000", "198.18.0.9:443"},
+		{"dokodemo-door", "tcp", "[fd00::1]:35000", "[fd00::9]:443"},
+		{"dokodemo-door", "udp", "[fd00::1]:35000", "[fd00::9]:443"},
+		{"tun", "tcp", "172.19.0.1:35000", "198.18.0.9:443"},
+	} {
+		t.Run(test.inbound+"/"+test.network+"/"+test.target, func(t *testing.T) {
+			source := netip.MustParseAddrPort(test.source)
+			target := netip.MustParseAddrPort(test.target)
+			network := net.Network_TCP
+			if test.network == "udp" {
+				network = net.Network_UDP
+			}
+			ctx := &R.Context{
+				Inbound: &session.Inbound{
+					Name:   test.inbound,
+					Source: net.Destination{Network: network, Address: net.IPAddress(source.Addr().AsSlice()), Port: net.Port(source.Port())},
+				},
+				Outbound: &session.Outbound{
+					OriginalTarget: net.Destination{Network: network, Address: net.IPAddress(target.Addr().AsSlice()), Port: net.Port(target.Port())},
+					Target:         net.Destination{Network: network, Address: net.DomainAddress("sniffed.example"), Port: 443},
+				},
+			}
+			calls := 0
+			finder := func(network, src string, sp uint16, dst string, dp uint16) (int, string, string, error) {
+				calls++
+				if network != test.network || src != source.Addr().String() || sp != source.Port() || dst != target.Addr().String() || dp != target.Port() {
+					t.Fatalf("wrong original tuple: %s %s:%d %s:%d", network, src, sp, dst, dp)
+				}
+				return 1012345, "1012345", "", nil
+			}
+			// Both process rules and Lua must survive target rewrites and DNS wrappers.
+			inbound := ctx.Inbound
+			uid, _, _, err := findFlowProcess(&dns.ResolvableContext{Context: ctx}, finder, test.network, source.Addr().String(), source.Port(), "203.0.113.9", 8443)
+			if err != nil || uid != 1012345 || calls != 1 {
+				t.Fatal(uid, err, calls)
+			}
+			if inbound.ProcessLookup != nil {
+				t.Fatal("process lookup leaked into a shared inbound")
+			}
+			uid, _, _, err = findProcess(ctx, finder)
+			if err != nil || uid != 1012345 || calls != 1 {
+				t.Fatal(uid, err, calls)
+			}
+			// A regular SOCKS inbound keeps the supplied upstream destination.
+			ctx.Inbound = &session.Inbound{Name: "socks"}
+			_, _, _, _ = findFlowProcess(ctx, func(_ string, _ string, _ uint16, dst string, dp uint16) (int, string, string, error) {
+				if dst != "203.0.113.9" || dp != 8443 {
+					t.Fatalf("ordinary inbound target changed: %s:%d", dst, dp)
+				}
+				return 0, "", "", nil
+			}, test.network, source.Addr().String(), source.Port(), "203.0.113.9", 8443)
+		})
+	}
+}
+
+func TestLocalProxyProcessUsesClientSocket(t *testing.T) {
+	for _, name := range []string{"http", "socks"} {
+		for _, address := range []string{"127.0.0.1", "::1"} {
+			t.Run(name+"/"+address, func(t *testing.T) {
+				ip := net.ParseAddress(address)
+				ctx := &R.Context{
+					Inbound: &session.Inbound{
+						Name: name, Source: net.TCPDestination(ip, 35000),
+						Local: net.TCPDestination(ip, 33751),
+					},
+					Outbound: &session.Outbound{Target: net.TCPDestination(net.DomainAddress("website.example"), 443)},
+				}
+				calls := 0
+				finder := func(network, source string, sp uint16, destination string, dp uint16) (int, string, string, error) {
+					calls++
+					if network != "tcp" || source != address || sp != 35000 || destination != address || dp != 33751 {
+						t.Fatalf("wrong proxy socket: %s %s:%d %s:%d", network, source, sp, destination, dp)
+					}
+					return 10342, "10342", "", nil
+				}
+				for range 2 {
+					uid, _, _, err := findFlowProcess(&dns.ResolvableContext{Context: ctx}, finder, "tcp", address, 35000, "", 0)
+					if err != nil || uid != 10342 || calls != 1 {
+						t.Fatal(uid, err, calls)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestAndroidPackageProcessRules(t *testing.T) {
+	flowmeta.RegisterPackageUIDResolver(func(name string) int {
+		if name == "com.example.app" || name == "com.example.shared" {
+			return 1012345
+		}
+		return -1
+	})
+	t.Cleanup(func() { flowmeta.RegisterPackageUIDResolver(nil) })
+	for _, test := range []struct {
+		name  string
+		uid   int
+		match bool
+	}{
+		{"com.example.app", 1012345, true},
+		{"com.example.app", 12345, true},
+		{"com.example.shared", 1012345, true},
+		{"com.example.app", 1012346, false},
+		{"com.example.app", -1, false},
+		{"unknown", 1012345, false},
+		{"1012345", 1012345, true},
+		{"12345", 1012345, false},
+	} {
+		matcher := NewProcessNameMatcher([]string{test.name})
+		name := strconv.Itoa(test.uid)
+		if match := matchFlowProcessName(matcher.ProcessNames, matcher.PackageAppIDs, test.uid, name); match != test.match {
+			t.Fatalf("process=%s uid=%d match=%v", test.name, test.uid, match)
+		}
+	}
+}

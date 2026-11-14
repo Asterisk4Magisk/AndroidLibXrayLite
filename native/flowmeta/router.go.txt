@@ -1,0 +1,73 @@
+// Copyright 2026, Asterisk4Magisk contributors
+// SPDX-License-Identifier: LGPL-3.0
+
+package router
+
+import (
+	"slices"
+
+	"github.com/2dust/AndroidLibXrayLite/native/flowmeta"
+	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/routing/dns"
+	"github.com/xtls/xray-core/features/routing/session"
+)
+
+func flowPackageAppIDs(names []string) []uint32 {
+	return flowmeta.PackageAppIDs(names)
+}
+
+func matchFlowProcessName(names []string, packageAppIDs []uint32, uid int, name string) bool {
+	if slices.Contains(names, name) {
+		return true
+	}
+	// Package rules apply to the same application across Android user profiles.
+	// Explicit numeric UID rules retain their full-UID comparison above.
+	return uid >= 0 && slices.Contains(packageAppIDs, uint32(uid)%100000)
+}
+
+func findFlowProcess(ctx routing.Context, finder func(string, string, uint16, string, uint16) (int, string, string, error), network, source string, sourcePort uint16, destination string, destinationPort uint16) (int, string, string, error) {
+	for {
+		switch value := ctx.(type) {
+		case *dns.ResolvableContext:
+			ctx = value.Context
+		case *session.Context:
+			if value.Inbound != nil {
+				if lookup := value.Inbound.ProcessLookup; lookup != nil {
+					return lookup()
+				}
+				local := value.Inbound.Local
+				proxySocket := network == "tcp" &&
+					(value.Inbound.Name == "http" || value.Inbound.Name == "socks") &&
+					local.IsValid() && local.Address.Family().IsIP()
+				if proxySocket || value.Inbound.Name == "dokodemo-door" || value.Inbound.Name == "tun" {
+					// Sniffing and FakeDNS may replace Target with a domain.
+					// Socket ownership still refers to the pre-sniff destination.
+					if proxySocket {
+						// The app owns its connection to the proxy listener, not the website.
+						destination = local.Address.IP().String()
+						destinationPort = uint16(local.Port)
+					} else if value.Outbound != nil {
+						original := value.Outbound.OriginalTarget
+						if original.IsValid() && original.Address.Family().IsIP() {
+							destination = original.Address.IP().String()
+							destinationPort = uint16(original.Port)
+						}
+					}
+					// Routing evaluates process rules and Lua on the same flow.
+					lookupDestination, lookupDestinationPort := destination, destinationPort
+					lookup := flowmeta.MemoizeProcessLookup(func() (int, string, string, error) {
+						return finder(network, source, sourcePort, lookupDestination, lookupDestinationPort)
+					})
+					// UDP dispatches may share the inbound; cache on this routing context.
+					inbound := *value.Inbound
+					inbound.ProcessLookup = lookup
+					value.Inbound = &inbound
+					return lookup()
+				}
+			}
+			return finder(network, source, sourcePort, destination, destinationPort)
+		default:
+			return finder(network, source, sourcePort, destination, destinationPort)
+		}
+	}
+}
